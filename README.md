@@ -115,11 +115,6 @@ I ran CrystalDiskInfo on my main desktop while I was at it:
 | D: Crucial MX500 2 TB | Good 99% | Clean |
 | E: WD 2 TB USB (5400 RPM) | **Caution** | **1,941 pending sectors**, 46,494 hours |
 
-**To do:** copy any irreplaceable videos off E:. It's failing. Use robocopy so it skips unreadable files and logs them:
-```
-robocopy E:\ <destination> /E /R:1 /W:1 /XD "System Volume Information" "$RECYCLE.BIN" /LOG:<destination>\WD-copy-log.txt /TEE
-```
-
 ---
 
 ## 5. Cloning the server onto the A55
