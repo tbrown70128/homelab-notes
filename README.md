@@ -163,7 +163,6 @@ sudo lvextend -r -l +100%FREE /dev/ubuntu-vg-1/ubuntu-lv
 
 - [ ] Keep the old SK hynix SSD untouched for a few weeks as a fallback, then retire it. Don't trust it with data.
 - [ ] Store the restic repository password somewhere **off** the server. A copy in Vaultwarden alone isn't enough, since Vaultwarden runs on the same server.
-- [ ] Copy irreplaceable videos off the failing WD 2 TB external drive.
 - [ ] Find out what's writing so much to the desktop's Crucial P3.
 - [ ] Decide what the ASUS all-in-one is for (kitchen screen for Mealie and Home Assistant? Jellyfin player?).
 - [ ] Optionally add the movie and TV folders on `/mnt/media` to the backups.
