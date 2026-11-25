@@ -1,6 +1,6 @@
 # Homelab log: November 25, 2026
 
-Notes from a day of fixing things on the home server. It started with a swap alert at 3 AM and ended with the server on a new SSD.
+Notes from a day of fixing things on the home server. It started with a swap alert at 3 AM and ended with the server on a new SSD. In the afternoon I brought the Raspberry Pi up to date and made it hold a second copy of every backup (sections 6–9).
 
 ## Summary
 
@@ -10,6 +10,11 @@ Notes from a day of fixing things on the home server. It started with a swap ale
 | Server boot SSD | Worn-out SK hynix 256 GB (wear level 1/100) | Silicon Power A55 1 TB, healthy |
 | Free space on `/` | 112 GB | 788 GB |
 | ASUS all-in-one | Stuck on a grey screen with a spinning cursor | Fresh Windows 11 on its Crucial SSD |
+| Raspberry Pi | 53 updates pending, package lists 5 weeks old, no automatic updates | Fully updated (kernel 6.18.60, new bootloader), `unattended-upgrades` on, joined the tailnet |
+| Copies of the backups | One, on the My Book plugged into the same server | Two: the My Book, plus a nightly copy on the Pi |
+| Paperless in backups | Not included | Nightly export, included in Backrest |
+| Home Assistant backups | Only inside the VM and HA Cloud (latest backup only) | Also written nightly to the server over NFS, then into Backrest and the Pi |
+| Recovery secrets | Restic password only on the server | Restic password, Vaultwarden recovery code and HA encryption key written down off the server |
 | Cost | | $0, using drives already on hand |
 
 ---
@@ -154,10 +159,95 @@ sudo lvextend -r -l +100%FREE /dev/ubuntu-vg-1/ubuntu-lv
 
 ---
 
+## 6. Raspberry Pi: updates and Tailscale
+
+The Pi 4 (8 GB, Debian 13 on a 1 TB USB SSD) runs the second Pi-hole and Unbound. Health was fine: 34 days up, 42 °C, never throttled, no failed services. But its package lists hadn't been refreshed since October 21, and **53 updates** were waiting, including security fixes for OpenSSL, Kerberos, NSS, zlib, `sudo` and others, a new kernel (6.18.50 → 6.18.60), and new bootloader firmware.
+
+```bash
+sudo apt update && sudo apt full-upgrade -y
+sudo reboot
+sudo rpi-eeprom-update -a     # bootloader: Sep 23 → Oct 30 release
+sudo reboot
+sudo apt purge linux-image-6.18.50+rpt-rpi-v8 linux-image-6.18.50+rpt-rpi-2712   # old kernel
+sudo apt install unattended-upgrades && sudo dpkg-reconfigure -plow unattended-upgrades
+```
+
+After the reboot the only errors in the boot log were harmless: `mmc1: Controller never released inhibit bit(s)` (no SD card, since it boots from USB), an ALSA udev rule warning, and one `bluetoothd: Failed to set mode`.
+
+**Tailscale:** installed on the Pi so it doesn't depend on the server's subnet route. Remote SSH still works if the server is down, and the Pi-hole can be used as tailnet DNS.
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+```
+
+**Second Pi-hole confirmed working:** the router hands out the server's Pi-hole first and the Pi's second, the Pi answers queries, and `nebula-sync` on the server pushes a full Teleporter sync from the primary to the Pi every hour.
+
+---
+
+## 7. A second copy of every backup, on the Pi
+
+Backrest's nightly restic backup (08:00 UTC, 7 daily / 4 weekly / 6 monthly) was healthy, but its only copy lived on the My Book, **which is plugged into the same server**. Theft, a power surge or ransomware on the server could take out the data and the backups together.
+
+Fix: the Pi pulls a mirror of the whole restic repository every morning at 05:30 Eastern (10:30 UTC, well after the backup finishes).
+
+- A dedicated SSH key on the Pi (`pi-backup`), added to the server's `authorized_keys`. It connects over Tailscale.
+- `~/bin/pull-laptop-backup.sh` on the Pi, run from the Pi's crontab:
+  ```bash
+  rsync -a --delete --partial --exclude='locks/' \
+        --backup --backup-dir="$OLD/$STAMP" \
+        server:/mnt/mybook/restic-repo/ ~/backups/server-restic/
+  ```
+  Anything the server deletes or changes (for example after a `prune`) is kept for 30 days in `~/backups/server-restic-old/<date>`, so a damaged or wiped repo on the server doesn't instantly wipe the Pi's copy too.
+- Logs go to `~/backups/logs/`, and `~/backups/LAST_SUCCESS` holds the time of the last good run.
+- The repo is already encrypted by restic, so the Pi only ever holds ciphertext.
+
+**First run:** 42 GB in about 10 minutes. The copy matches the source exactly (2,516 files, 44,060,860,636 bytes, 8 snapshots), and a dry-run `rsync` afterwards found nothing left to transfer.
+
+Gotchas:
+- The first attempt to add the key ran on the Pi instead of the server. Check the prompt (`@server` vs `@pi`) before pasting.
+- The server runs on UTC and the Pi on Eastern time, so check the timezone before scheduling one job after another.
+
+---
+
+## 8. Paperless and Home Assistant added to the backups
+
+**Paperless** wasn't in the Backrest plan at all. I followed the same pattern as Immich and Nextcloud: back up the files, leave out the live database folder, and rely on a proper export instead.
+
+- Server crontab, 07:30 UTC (half an hour before Backrest):
+  ```
+  30 7 * * * docker exec paperless-webserver-1 document_exporter ../export --no-progress-bar >> $HOME/paperless/export.log 2>&1
+  ```
+- Backrest plan `server-data`: added `/mnt/media/paperless`, excluded `/mnt/media/paperless/pgdata` and `/mnt/media/paperless/redisdata`. Saved `config.json.bak-2026-11-25` first, then restarted the container. No errors, and the next run was scheduled normally.
+- The exporter warns that sensitive fields are in plaintext without a passphrase. That's acceptable here, because the export only leaves the server inside the encrypted restic repo.
+
+**Home Assistant** backups only existed inside the VM and in HA Cloud, which keeps just the latest one. A dead server would have taken the rest.
+
+- On the server: installed `nfs-kernel-server` and exported `/mnt/media/backups/homeassistant` to the HA VM's address only (`rw,sync,all_squash,anonuid=1000`). Opened UFW port 2049/tcp from that one address. Backrest already covers `/mnt/media/backups`, so nothing else needed changing.
+- Reserved the HA VM's address in the router, so the share can't break from a DHCP change.
+- In HA: Settings → System → Storage → Add network storage (`laptop_backups`, Backup, NFS), then enabled it as a location under Backup settings.
+- First backup: 742 MB, a valid tar, readable by the Backrest container.
+
+---
+
+## 9. Vaultwarden two-step lockout
+
+When I went to save the restic password in Vaultwarden, it asked for an authenticator code, and no authenticator app had a "Vaultwarden" entry. There's no admin panel (no `ADMIN_TOKEN`), so the options were the recovery code or editing the database by hand.
+
+- The **recovery code** worked. Using it turns two-step login **off**, so I turned it back on straight away (Settings → Security → Two-step login → Authenticator app) and saved the new recovery code.
+- Lesson: Bitwarden-compatible servers usually show up in authenticator apps as **"Bitwarden"**, not "Vaultwarden".
+
+Now written down off the server: the **restic/Backrest repository password**, the **Vaultwarden recovery code** and the **Home Assistant backup encryption key**. With those three, everything can be restored from the Pi's copy even if the server is gone.
+
+---
+
 ## Open items
 
 - [ ] Keep the old SK hynix SSD untouched for a few weeks as a fallback, then retire it. Don't trust it with data.
-- [ ] Store the restic repository password somewhere **off** the server. A copy in Vaultwarden alone isn't enough, since Vaultwarden runs on the same server.
+- [x] Store the restic repository password somewhere **off** the server. *Done: written down offline, along with the Vaultwarden recovery code and the HA encryption key.*
+- [ ] Check that the first full overnight run worked: Paperless and HA in the 08:00 UTC snapshot, and `~/backups/LAST_SUCCESS` on the Pi updated after 05:30 Eastern.
+- [ ] Do a real restore test from the Pi's copy (for example, restore Vaultwarden into a scratch container).
+- [ ] Get a copy out of the house. The Pi is a separate device but sits in the same home.
 - [ ] Find out what's writing so much to the desktop's Crucial P3.
 - [ ] Decide what the ASUS all-in-one is for (kitchen screen for Mealie and Home Assistant? Jellyfin player?).
 - [ ] Optionally add the movie and TV folders on `/mnt/media` to the backups.
