@@ -1,0 +1,7 @@
+# /etc/default/netwatch
+# Interface to reset when the router is unreachable. On a bridged host, use the
+# physical NIC (not the bridge) so VMs on the bridge aren't disconnected.
+PHYS_IF=eth0
+RESET_MIN=3
+REBOOT_MIN=10
+MAX_REBOOTS=3

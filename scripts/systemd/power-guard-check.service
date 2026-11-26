@@ -1,0 +1,6 @@
+[Unit]
+Description=Power guard: power off with RTC wake alarm on low battery
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/power-guard check

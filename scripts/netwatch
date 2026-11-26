@@ -1,0 +1,79 @@
+#!/bin/bash
+# netwatch: recover from a hung network on this machine. Run every minute by netwatch.timer.
+#
+#   router unreachable  -> local fault: bounce the NIC at RESET_MIN, reboot at REBOOT_MIN
+#                          (at most MAX_REBOOTS per 24 h, so it can't reboot-loop)
+#   router OK, no internet -> ISP/modem fault: log only (a reboot here can't help)
+#
+# Settings: /etc/default/netwatch (PHYS_IF, RESET_MIN, REBOOT_MIN, MAX_REBOOTS)
+# Disable:  sudo touch /etc/netwatch.disable
+# Logs:     journalctl -t netwatch
+# Testing:  NW_DRY=1 NW_GW=<ip> NW_NET=<ip> netwatch
+set -u
+
+RESET_MIN=3; REBOOT_MIN=10; MAX_REBOOTS=3; PHYS_IF=""
+[[ -r /etc/default/netwatch ]] && . /etc/default/netwatch
+INET_HOSTS=(${NW_NET:-1.1.1.1 8.8.8.8 9.9.9.9})
+RUN=${NW_RUN:-/run/netwatch}; LIB=${NW_LIB:-/var/lib/netwatch}; DRY=${NW_DRY:-0}
+mkdir -p "$RUN" "$LIB"
+
+log() { logger -t netwatch "$*" 2>/dev/null; [[ -t 1 ]] && echo "netwatch: $*"; true; }
+ping1() { ping -c1 -W3 "$1" >/dev/null 2>&1; }
+act() { if [[ $DRY == 1 ]]; then log "dry run: would run: $*"; else "$@"; fi; }
+
+[[ -e /etc/netwatch.disable ]] && exit 0
+
+# On battery = power cut, so the router is down too; rebooting would only waste battery.
+# (power-guard handles that case on the laptop server.)
+for ps in /sys/class/power_supply/*; do
+    if [[ $(cat "$ps/type" 2>/dev/null) == Mains && $(cat "$ps/online" 2>/dev/null) == 0 && -z ${NW_GW:-} ]]; then
+        rm -f "$RUN/down_since" "$RUN/reset_done"; exit 0
+    fi
+done
+
+gw=${NW_GW:-$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')}
+dev=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+PHYS_IF=${PHYS_IF:-$dev}
+
+lan_ok=0; [[ -n $gw ]] && { ping1 "$gw" || ping1 "$gw"; } && lan_ok=1
+net_ok=0; for h in "${INET_HOSTS[@]}"; do ping1 "$h" && { net_ok=1; break; }; done
+
+now=$(date +%s)
+if (( net_ok )); then
+    [[ -e $RUN/down_since ]] && log "internet back after $(( (now - $(cat $RUN/down_since)) / 60 )) min"
+    rm -f "$RUN"/down_since "$RUN"/reset_done "$RUN"/isp_logged
+    exit 0
+fi
+
+[[ -e $RUN/down_since ]] || echo "$now" > "$RUN/down_since"
+mins=$(( (now - $(cat "$RUN/down_since")) / 60 ))
+
+if (( lan_ok )); then
+    # Router answers but the internet doesn't: not this machine's fault.
+    [[ -e $RUN/isp_logged ]] || { log "router $gw reachable but internet down; ISP/modem problem, not rebooting"; touch "$RUN/isp_logged"; }
+    rm -f "$RUN/reset_done"
+    exit 0
+fi
+
+log "router ${gw:-<no default route>} unreachable for ${mins} min"
+
+if (( mins >= RESET_MIN )) && [[ ! -e $RUN/reset_done ]]; then
+    log "resetting network interface ${PHYS_IF:-?}"
+    touch "$RUN/reset_done"
+    if [[ -n $PHYS_IF ]]; then
+        act ip link set dev "$PHYS_IF" down; sleep 3; act ip link set dev "$PHYS_IF" up
+    fi
+    exit 0
+fi
+
+if (( mins >= REBOOT_MIN )); then
+    touch "$LIB/reboots"
+    recent=$(awk -v t=$((now - 86400)) '$1 > t' "$LIB/reboots" | wc -l)
+    if (( recent >= MAX_REBOOTS )); then
+        [[ -e $RUN/limit_logged ]] || { log "reboot limit reached ($recent in 24 h); not rebooting"; touch "$RUN/limit_logged"; }
+        exit 0
+    fi
+    log "router still unreachable after ${mins} min; rebooting ($((recent + 1))/$MAX_REBOOTS today)"
+    [[ $DRY == 1 ]] || echo "$now" >> "$LIB/reboots"
+    act systemctl reboot
+fi

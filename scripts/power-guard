@@ -1,0 +1,51 @@
+#!/bin/bash
+# power-guard: bring the laptop server back after a power outage using the RTC alarm.
+# (Wake-on-LAN can't wake this ASUS X411UN from off; the RTC alarm can.)
+#
+#   power-guard check  - run every minute: on battery and <= LOW% -> arm alarm, power off
+#   power-guard boot   - run early at boot: still on battery and <= BOOT_LOW% ->
+#                        re-arm alarm and power off before Docker/VMs start
+#
+# AC power always wins: if the charger is connected, nothing happens.
+# Disable entirely with:  sudo touch /etc/power-guard.disable
+# Testing: --dry-run, and env overrides PG_AC=0|1 PG_CAP=<percent>
+set -u
+
+LOW=20          # shut down at or below this % while on battery
+BOOT_LOW=25     # on boot, stay off unless battery is above this (hysteresis)
+WAKE_SECS=1800  # check again every 30 min while switched off
+AC=/sys/class/power_supply/AC0/online
+BAT=/sys/class/power_supply/BAT0/capacity
+
+mode=${1:-}; dry=0; [[ ${2:-} == --dry-run ]] && dry=1
+log() { [[ -t 1 ]] && echo "power-guard[$mode]: $*"; logger -t power-guard "[$mode] $*" 2>/dev/null || true; }
+
+[[ -e /etc/power-guard.disable ]] && { log "disabled by /etc/power-guard.disable"; exit 0; }
+
+# Wait briefly at boot for the ACPI power-supply drivers.
+for _ in $(seq 1 15); do [[ -r $AC && -r $BAT ]] && break; sleep 1; done
+ac=${PG_AC:-$(cat "$AC" 2>/dev/null)}
+cap=${PG_CAP:-$(cat "$BAT" 2>/dev/null)}
+if [[ ! $ac =~ ^[01]$ || ! $cap =~ ^[0-9]+$ ]]; then
+    log "can't read AC/battery (ac='$ac' cap='$cap'); doing nothing"; exit 0
+fi
+
+case $mode in
+    check) limit=$LOW ;;
+    boot)  limit=$BOOT_LOW ;;
+    *) echo "usage: $0 check|boot [--dry-run]" >&2; exit 2 ;;
+esac
+
+if [[ $ac == 1 ]]; then
+    [[ $mode == boot ]] && log "on AC power (battery ${cap}%); booting normally"
+    exit 0
+fi
+if (( cap > limit )); then
+    [[ $mode == boot ]] && log "on battery at ${cap}% (> ${limit}%); booting normally"
+    exit 0
+fi
+
+log "on battery at ${cap}% (<= ${limit}%): arming RTC alarm for +${WAKE_SECS}s and powering off"
+if (( dry )); then log "dry run: would run 'rtcwake -m no -s $WAKE_SECS' and 'systemctl poweroff'"; exit 0; fi
+/usr/sbin/rtcwake -m no -s "$WAKE_SECS" || { log "rtcwake failed; NOT powering off"; exit 1; }
+systemctl poweroff

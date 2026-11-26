@@ -1,0 +1,6 @@
+[Unit]
+Description=netwatch: recover from a hung network connection
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/netwatch

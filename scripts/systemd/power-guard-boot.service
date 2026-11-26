@@ -1,0 +1,11 @@
+[Unit]
+Description=Power guard: stay off if still on low battery after an RTC wake
+After=local-fs.target systemd-udev-settle.service
+Before=docker.service containerd.service libvirtd.service libvirt-guests.service nfs-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/power-guard boot
+
+[Install]
+WantedBy=multi-user.target
