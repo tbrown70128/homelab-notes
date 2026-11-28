@@ -1,0 +1,2 @@
+# /etc/hc-ping.conf (root, mode 600): the server's healthchecks.io ping URL
+HC_PING_URL=https://hc-ping.com/<uuid>

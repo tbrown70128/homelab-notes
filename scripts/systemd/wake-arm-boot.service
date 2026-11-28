@@ -1,0 +1,14 @@
+[Unit]
+Description=wake-arm: detect unexpected power-offs at boot; clear wake alarm on clean shutdown
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/wake-arm boot
+ExecStop=/usr/local/sbin/wake-arm shutdown
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

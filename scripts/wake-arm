@@ -1,0 +1,104 @@
+#!/bin/bash
+# wake-arm: rolling RTC wake alarm, so the server turns itself back on after a
+# sudden power-off (thermal cutoff, crash, power button held).
+#
+#   wake-arm arm        every minute (wake-arm.timer): push the alarm to now + ARM_SECS
+#   wake-arm boot       at boot: detect an unexpected power-off, alert, enforce restart limit
+#   wake-arm shutdown   on clean shutdown/reboot: clear the alarm so the server stays off
+#   wake-arm keep       call right before a planned power-off that set its own alarm
+#                       (power-guard, heat-alert); the shutdown step then leaves it alone
+#   wake-arm status     show the alarm, recent unexpected power-offs, hold state
+#   wake-arm reset      clear the restart-limit hold and history
+#
+# Disable entirely: sudo touch /etc/wake-arm.disable
+set -u
+
+ARM_SECS=600            # come back ~10 min after a sudden power-off
+LIMIT=3                 # this many unexpected power-offs ...
+WINDOW=$((6*3600))      # ... within this window -> stop auto-restarting
+DIR=/var/lib/wake-arm
+RUNNING=$DIR/running    # exists while up; still there at boot = last power-off was unexpected
+HISTORY=$DIR/unexpected # one epoch per unexpected power-off
+HOLD=$DIR/hold          # restart limit reached: no rolling alarm until `wake-arm reset`
+KEEP=/run/wake-arm.keep
+ALARM=/sys/class/rtc/rtc0/wakealarm
+WEBHOOK=""; [[ -r /etc/heat-alert.conf ]] && . /etc/heat-alert.conf
+[[ -n ${WA_NO_DISCORD:-} ]] && WEBHOOK=""   # for testing
+
+log() { logger -t wake-arm "$*"; [[ -t 1 ]] && echo "wake-arm: $*"; }
+discord() {
+  [[ -n $WEBHOOK ]] || return 0
+  local i
+  for (( i=0; i<${2:-6}; i++ )); do  # network may still be coming up at boot
+    python3 -I -c 'import json,sys; print(json.dumps({"username":"server","content":sys.argv[1]}))' "$1" |
+      curl -fsS -m 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK" >/dev/null && return 0
+    (( i+1 < ${2:-6} )) && sleep 10
+  done
+  log "Discord send failed"
+}
+clear_alarm() { echo 0 > "$ALARM"; }
+mkdir -p "$DIR"
+now=$(date +%s)
+
+case ${1:-} in
+arm)
+  [[ -e /etc/wake-arm.disable || -e $HOLD || -e $KEEP ]] && exit 0
+  /usr/sbin/rtcwake -m no -s "$ARM_SECS" >/dev/null || log "rtcwake failed"
+  # Linux only enables the ACPI RTC wake event during a clean shutdown; without this a
+  # hard power-off (thermal trip, button held) ignores the alarm. Found 2026-11-28.
+  RT=/sys/firmware/acpi/interrupts/ff_rt_clk
+  grep -qw enabled "$RT" || { echo enable > "$RT" && log "enabled ACPI RTC wake event"; }
+  ;;
+boot)
+  if [[ -e $RUNNING ]]; then
+    echo "$now" >> "$HISTORY"
+    recent=$(awk -v c=$((now - WINDOW)) '$1 >= c' "$HISTORY" | wc -l)
+    awk -v c=$((now - WINDOW)) '$1 >= c' "$HISTORY" > "$HISTORY.tmp" && mv "$HISTORY.tmp" "$HISTORY"
+    if (( recent >= LIMIT )); then
+      touch "$HOLD"; clear_alarm
+      log "unexpected power-off #$recent within $((WINDOW/3600))h: restart limit reached, auto-restart disabled"
+      discord "⚠️ server is back after an unexpected power-off, the ${recent}th in $((WINDOW/3600)) h. Auto-restart is now OFF so it can't keep cycling; if it dies again it will stay off. Check temps/logs, then run: sudo wake-arm reset"
+    else
+      log "previous power-off was unexpected (#$recent within $((WINDOW/3600))h)"
+      discord "⚠️ server came back after an unexpected power-off (heat cutoff, crash, or power button held). That's #$recent in the last $((WINDOW/3600)) h; auto-restart stops after $LIMIT."
+    fi
+  fi
+  touch "$RUNNING"
+  rm -f "$KEEP"
+  "$0" arm   # arm right away instead of waiting for the first timer tick
+  ;;
+shutdown)
+  rm -f "$RUNNING"
+  if [[ -e $KEEP ]]; then log "planned power-off with its own wake alarm; leaving alarm set"
+  else clear_alarm; log "clean shutdown: wake alarm cleared"; fi
+  ;;
+keep)
+  touch "$KEEP"
+  ;;
+heat-shutdown)  # called by heat-alert; $2 = temperature. Counts toward the restart limit.
+  echo "$now" >> "$HISTORY"
+  recent=$(awk -v c=$((now - WINDOW)) '$1 >= c' "$HISTORY" | wc -l)
+  touch "$KEEP"; systemctl stop wake-arm.timer
+  if (( recent >= LIMIT )) || [[ -e $HOLD || -e /etc/wake-arm.disable ]]; then
+    touch "$HOLD"; clear_alarm
+    log "heat shutdown at ${2:-?}°C (#$recent in $((WINDOW/3600))h): restart limit reached, staying OFF"
+    discord "🛑 server shutting down at ${2:-?}°C to avoid the 100°C cutoff. That's #$recent in $((WINDOW/3600)) h, so it will STAY OFF. Press the power button once the cause is fixed, then run: sudo wake-arm reset" 1
+  else
+    /usr/sbin/rtcwake -m no -s 1200 >/dev/null || log "rtcwake failed"
+    log "heat shutdown at ${2:-?}°C (#$recent in $((WINDOW/3600))h): will power back on in 20 min"
+    discord "🛑 server shutting down cleanly at ${2:-?}°C to avoid the 100°C cutoff. It will power back on in ~20 min (#$recent in $((WINDOW/3600)) h; stays off after $LIMIT)." 1
+  fi
+  [[ ${DRY:-0} == 1 ]] && { log "dry run: not powering off"; rm -f "$KEEP"; systemctl start wake-arm.timer; exit 0; }
+  systemctl poweroff
+  ;;
+status)
+  a=$(cat "$ALARM"); [[ -n $a ]] && echo "alarm: $(date -d @"$a") (in $(( (a-now)/60 )) min)" || echo "alarm: none"
+  [[ -e $HOLD ]] && echo "HOLD: restart limit reached; auto-restart off (sudo wake-arm reset)"
+  [[ -e /etc/wake-arm.disable ]] && echo "disabled by /etc/wake-arm.disable"
+  echo "unexpected power-offs on record:"; [[ -s $HISTORY ]] && while read -r t; do echo "  $(date -d @"$t")"; done < "$HISTORY" || echo "  none"
+  ;;
+reset)
+  rm -f "$HOLD" "$HISTORY"; log "restart limit reset"; "$0" arm
+  ;;
+*) echo "usage: $0 arm|boot|shutdown|keep|heat-shutdown <temp>|status|reset" >&2; exit 2 ;;
+esac

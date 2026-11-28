@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep the RTC wake alarm 10 min ahead (auto power-on after a sudden power-off)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

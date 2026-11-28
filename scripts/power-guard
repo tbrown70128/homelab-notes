@@ -47,5 +47,6 @@ fi
 
 log "on battery at ${cap}% (<= ${limit}%): arming RTC alarm for +${WAKE_SECS}s and powering off"
 if (( dry )); then log "dry run: would run 'rtcwake -m no -s $WAKE_SECS' and 'systemctl poweroff'"; exit 0; fi
-/usr/sbin/rtcwake -m no -s "$WAKE_SECS" || { log "rtcwake failed; NOT powering off"; exit 1; }
+/usr/local/sbin/wake-arm keep; systemctl stop wake-arm.timer  # keep our alarm through shutdown
+/usr/sbin/rtcwake -m no -s "$WAKE_SECS" || { log "rtcwake failed; NOT powering off"; rm -f /run/wake-arm.keep; systemctl start wake-arm.timer; exit 1; }
 systemctl poweroff

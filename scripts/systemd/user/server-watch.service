@@ -1,0 +1,6 @@
+[Unit]
+Description=Check whether server is up; Discord alert on down/up
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/server-watch

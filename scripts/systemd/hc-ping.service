@@ -1,0 +1,8 @@
+[Unit]
+Description=Check in with healthchecks.io (alerts from outside if this server stops checking in)
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/hc-ping.conf
+ExecStart=/usr/bin/curl -fsS -m 10 --retry 3 -o /dev/null ${HC_PING_URL}

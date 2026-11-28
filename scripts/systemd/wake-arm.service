@@ -1,0 +1,8 @@
+[Unit]
+Description=wake-arm: push the RTC wake alarm forward
+After=wake-arm-boot.service
+Requires=wake-arm-boot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wake-arm arm

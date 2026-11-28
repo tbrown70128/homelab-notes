@@ -1,0 +1,114 @@
+#!/bin/bash
+# server-watch (runs on pi): Discord alerts for
+#   - server going down / coming back (the server can't report its own outage)
+#   - internet outages: Discord is unreachable while the internet is down, so the Pi
+#     records the outage and reports it once the connection is back. Any alerts that
+#     couldn't be sent in the meantime are queued and delivered then.
+# Run every minute by the user timer ~/.config/systemd/user/server-watch.timer.
+#
+#   server-watch          normal check
+#   server-watch --test   send a test message
+#   SW_FORCE_DOWN=1       pretend the server is unreachable (testing)
+#   SW_FORCE_NO_NET=1     pretend the internet is down (testing; Discord sends are queued)
+#
+# Config: ~/.config/server-watch.conf (mode 600):  WEBHOOK=https://discord.com/api/webhooks/......
+#         optional HC_PING_URL=https://hc-ping.com/<uuid>  (healthchecks.io "home-internet" check)
+# Logs: journalctl -t server-watch
+set -u
+
+HOST=192.168.x.10
+NAME=server
+FAILS_FOR_DOWN=3                 # consecutive failed checks (≈ minutes) before calling it down
+NET_FAILS_FOR_DOWN=2             # same for the internet (ignores one-off blips)
+NET_TARGETS="1.1.1.1 8.8.8.8 9.9.9.9"
+REMIND=$((6*3600))               # reminder while the server is still down
+SDIR=${XDG_STATE_HOME:-$HOME/.local/state}
+STATE=$SDIR/server-watch.state
+QUEUE=$SDIR/server-watch.queue   # one JSON-encoded message per line
+WEBHOOK=""; [[ -r $HOME/.config/server-watch.conf ]] && . "$HOME/.config/server-watch.conf"
+mkdir -p "$SDIR"
+
+log() { logger -t server-watch "$*"; [[ -t 1 ]] && echo "server-watch: $*"; }
+hm()  { date -d "@$1" '+%b %-d %H:%M'; }
+dur() { local s=$1; (( s < 3600 )) && echo "$((s/60)) min" || echo "$((s/3600)) h $(( (s%3600)/60 )) min"; }
+
+post() {  # post one message; returns non-zero on failure
+  [[ -n $WEBHOOK && -z ${SW_FORCE_NO_NET:-} ]] || return 1
+  python3 -I -c 'import json,sys; print(json.dumps({"username":"pi","content":sys.argv[1]}))' "$1" |
+    curl -fsS -m 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK" >/dev/null 2>&1
+}
+discord() {  # send now, or queue it (with the time it happened) if Discord can't be reached
+  log "$1"
+  [[ -n $WEBHOOK ]] || { log "no WEBHOOK configured"; return; }
+  post "$1" && return
+  log "Discord unreachable; queued"
+  python3 -I -c 'import json,sys; print(json.dumps(sys.argv[1]))' "[queued from $(hm "$(date +%s)")] $1" >> "$QUEUE"
+}
+flush_queue() {
+  [[ -s $QUEUE ]] || return 0
+  local line msg left=""
+  while IFS= read -r line; do
+    msg=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1]))' "$line")
+    if [[ -z $left ]] && post "$msg"; then sleep 1; else left+="$line"$'\n'; fi
+  done < "$QUEUE"
+  printf '%s' "$left" > "$QUEUE"
+  [[ -s $QUEUE ]] || log "queued messages delivered"
+}
+
+if [[ ${1:-} == --test ]]; then discord "🧪 server-watch test from pi (watching $NAME and the internet)"; exit 0; fi
+
+fails=0; down_since=0; alerted=0; last_remind=0; net_fails=0; net_down_since=0; net_down=0
+[[ -r $STATE ]] && . "$STATE"
+now=$(date +%s)
+
+# ---- internet ----------------------------------------------------------------
+net_ok=0
+if [[ -z ${SW_FORCE_NO_NET:-} ]]; then
+  for t in $NET_TARGETS; do ping -c1 -W3 "$t" >/dev/null 2>&1 && { net_ok=1; break; }; done
+fi
+if (( net_ok )); then
+  if (( net_down )); then
+    discord "🌐 Internet was down from $(hm "$net_down_since") to $(hm "$now") ($(dur $((now - net_down_since)))). Discord alerts couldn't be sent during that time; any that were missed follow below."
+  fi
+  net_fails=0; net_down_since=0; net_down=0
+  # healthchecks.io "home-internet" check: if these check-ins stop (internet or house
+  # power down), healthchecks.io alerts from outside while it's happening.
+  [[ -n ${HC_PING_URL:-} ]] && { curl -fsS -m 10 --retry 2 -o /dev/null "$HC_PING_URL" || log "healthchecks.io check-in failed"; }
+  flush_queue
+else
+  (( net_fails == 0 )) && net_down_since=$now
+  net_fails=$((net_fails + 1))
+  if (( !net_down && net_fails >= NET_FAILS_FOR_DOWN )); then net_down=1; log "internet down since $(hm "$net_down_since")"; fi
+fi
+
+# ---- server -------------------------------------------------------------
+# ping = powered and on the network; SSH banner = OS and services alive (a frozen
+# kernel can still answer ping); web = Uptime Kuma container.
+ping_ok=0; ssh_ok=0; web_ok=0
+if [[ -z ${SW_FORCE_DOWN:-} ]]; then
+  ping -c2 -W2 "$HOST" >/dev/null 2>&1 && ping_ok=1
+  [[ $(timeout 6 bash -c "exec 3<>/dev/tcp/$HOST/22; head -c3 <&3" 2>/dev/null) == SSH ]] && ssh_ok=1
+  [[ $(curl -s -o /dev/null -w '%{http_code}' -m 8 "http://$HOST:3001/") =~ ^[23] ]] && web_ok=1
+fi
+
+if (( ssh_ok )); then
+  if (( alerted )); then
+    msg="🟢 $NAME is back up after $(dur $((now - down_since)))"
+    (( web_ok )) || msg+=" (web services / Uptime Kuma not answering yet)"
+    discord "$msg"
+  fi
+  fails=0; down_since=0; alerted=0; last_remind=0
+else
+  (( fails == 0 )) && down_since=$now
+  fails=$((fails + 1))
+  if (( ping_ok )); then why="it answers ping but SSH doesn't, so it's probably frozen or hung (the watchdog should reset it within ~1 min)"
+  else why="no response to ping, so it's off or off the network (wake-arm should power it back on within ~10 min)"; fi
+  if (( !alerted && fails >= FAILS_FOR_DOWN )); then
+    discord "🔴 $NAME is DOWN since $(hm "$down_since"): $why."; alerted=1; last_remind=$now
+  elif (( alerted && now - last_remind >= REMIND )); then
+    discord "🔴 $NAME is still down ($(dur $((now - down_since)))): $why."; last_remind=$now
+  fi
+fi
+
+printf '%s=%s\n' fails "$fails" down_since "$down_since" alerted "$alerted" last_remind "$last_remind" \
+  net_fails "$net_fails" net_down_since "$net_down_since" net_down "$net_down" > "$STATE"

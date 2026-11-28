@@ -1,0 +1,4 @@
+# ~/.config/server-watch.conf on the Pi (mode 600)
+WEBHOOK=https://discord.com/api/webhooks/...
+# optional: healthchecks.io "home internet" check
+HC_PING_URL=https://hc-ping.com/<uuid>

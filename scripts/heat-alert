@@ -1,0 +1,87 @@
+#!/bin/bash
+# heat-alert: send a Discord alert when the CPU runs hot for too long.
+# Runs every minute from heat-alert.timer. Logs via `journalctl -t heat-alert`.
+#
+#   heat-alert          normal check (what the timer runs)
+#   heat-alert --test   send a test message now, with the current readings
+#
+# Config: /etc/heat-alert.conf (root-only), e.g.  WEBHOOK=https://discord.com/api/webhooks/......
+# Env HA_TEMP=<°C> overrides the sensor reading for testing.
+set -u
+
+WARN=90        # °C: alert if at/above this for WARN_MINS minutes
+WARN_MINS=5
+CRIT=97        # °C: alert immediately (cutoff is 100°C)
+SHUTDOWN=98    # °C: two checks in a row at/above this -> clean shutdown + wake alarm (wake-arm)
+CLEAR=80       # °C: send "back to normal" once below this after an alert
+REPEAT=3600    # seconds between repeat alerts while still hot
+STATE=/run/heat-alert.state
+WEBHOOK=""
+[[ -r /etc/heat-alert.conf ]] && . /etc/heat-alert.conf
+
+log() { logger -t heat-alert "$*"; [[ -t 1 ]] && echo "heat-alert: $*"; }
+
+read_temp() {
+  local h
+  for h in /sys/class/hwmon/hwmon*; do
+    [[ $(cat "$h/name" 2>/dev/null) == coretemp ]] && { echo $(( $(cat "$h/temp1_input") / 1000 )); return; }
+  done
+}
+read_fan() { local f; f=$(grep -l '^asus$' /sys/class/hwmon/hwmon*/name 2>/dev/null | head -1); [[ -n $f ]] && cat "${f%/name}/fan1_input" 2>/dev/null; }
+
+# Top 3 CPU users right now (sampled over 2s), with their Docker container name when they have one.
+top_procs() {
+  top -bn2 -d2 -o %CPU -w 200 | awk '/^top -/{n++} n==2 && /^ *[0-9]+ /{print $1, $9, $12; if(++c==3) exit}' |
+  while read -r pid cpu cmd; do
+    local where="" cid
+    cid=$(grep -oE 'docker[-/]([0-9a-f]{64})' "/proc/$pid/cgroup" 2>/dev/null | head -1 | grep -oE '[0-9a-f]{64}')
+    [[ -n $cid ]] && where=" in container $(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | tr -d /)"
+    [[ $cmd == qemu* ]] && where=" (VM)"
+    echo "• ${cmd} ${cpu}%${where}"
+  done
+}
+
+send() {  # $1 = title line
+  local body temp fan
+  temp=$(read_temp); fan=$(read_fan)
+  body="$1
+CPU ${temp}°C (cutoff 100°C), fan ${fan:-?} rpm
+Top CPU users:
+$(top_procs)"
+  log "$1 (temp ${temp}°C)"
+  if [[ -z $WEBHOOK ]]; then log "no WEBHOOK in /etc/heat-alert.conf; alert only logged"; return; fi
+  python3 -I -c 'import json,sys; print(json.dumps({"username":"server","content":sys.argv[1]}))' "$body" |
+    curl -fsS -m 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK" >/dev/null || log "Discord send failed"
+}
+
+if [[ ${1:-} == --test ]]; then send "🧪 heat-alert test from server"; exit 0; fi
+
+temp=${HA_TEMP:-$(read_temp)}
+[[ $temp =~ ^[0-9]+$ ]] || { log "can't read CPU temperature"; exit 0; }
+now=$(date +%s)
+hot_since=0; last_alert=0; crit_streak=0
+[[ -r $STATE ]] && . "$STATE"
+
+if (( temp >= SHUTDOWN )); then crit_streak=$((crit_streak + 1)); else crit_streak=0; fi
+if (( crit_streak >= 2 )); then
+  printf 'hot_since=0\nlast_alert=0\ncrit_streak=0\n' > "$STATE"
+  log "CPU at ${temp}°C for 2 checks: handing off to wake-arm heat-shutdown"
+  exec /usr/local/sbin/wake-arm heat-shutdown "$temp"
+fi
+
+if (( temp >= WARN )); then
+  (( hot_since == 0 )) && hot_since=$now
+  mins=$(( (now - hot_since) / 60 ))
+  due=$(( last_alert == 0 || now - last_alert >= REPEAT ))
+  if (( temp >= CRIT )) && (( last_alert == 0 || now - last_alert >= 900 )); then
+    send "🔥 server CPU at ${temp}°C — close to the 100°C cutoff"; last_alert=$now
+  elif (( mins >= WARN_MINS && due )); then
+    send "🌡️ server CPU has been at ${WARN}°C+ for ${mins} min"; last_alert=$now
+  fi
+elif (( temp < CLEAR )); then
+  (( last_alert > 0 )) && send "✅ server CPU back to normal"
+  hot_since=0; last_alert=0
+else
+  hot_since=0   # 80–89°C: not hot enough to keep counting, but don't clear an active alert yet
+fi
+printf 'hot_since=%s\nlast_alert=%s\ncrit_streak=%s\n' "$hot_since" "$last_alert" "$crit_streak" > "$STATE"

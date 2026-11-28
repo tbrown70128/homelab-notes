@@ -1,0 +1,6 @@
+[Unit]
+Description=heat-alert: Discord alert when the CPU runs hot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/heat-alert
