@@ -25,7 +25,7 @@ ALARM=/sys/class/rtc/rtc0/wakealarm
 WEBHOOK=""; [[ -r /etc/heat-alert.conf ]] && . /etc/heat-alert.conf
 [[ -n ${WA_NO_DISCORD:-} ]] && WEBHOOK=""   # for testing
 
-log() { logger -t wake-arm "$*"; [[ -t 1 ]] && echo "wake-arm: $*"; }
+log() { logger -t wake-arm "$*"; [[ -t 1 ]] && echo "wake-arm: $*"; return 0; }
 discord() {
   [[ -n $WEBHOOK ]] || return 0
   local i
@@ -102,3 +102,4 @@ reset)
   ;;
 *) echo "usage: $0 arm|boot|shutdown|keep|heat-shutdown <temp>|status|reset" >&2; exit 2 ;;
 esac
+exit 0

@@ -1,0 +1,13 @@
+[Unit]
+Description=Remove the unused Wi-Fi card from the PCIe bus (suspected cause of freezes)
+DefaultDependencies=no
+After=systemd-udev-trigger.service
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/disable-wifi-card
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

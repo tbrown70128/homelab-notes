@@ -1,0 +1,12 @@
+#!/bin/bash
+# Take the unused RTL8822BE Wi-Fi card (10ec:b822) off the PCIe bus and disable its
+# link at the root port, so it can't raise errors or lock up the bus.
+set -u
+for d in /sys/bus/pci/devices/*; do
+  [[ $(cat "$d/vendor"):$(cat "$d/device") == 0x10ec:0xb822 ]] || continue
+  port=$(basename "$(dirname "$(readlink -f "$d")")")      # upstream root port, e.g. 0000:00:1c.5
+  echo 1 > "$d/remove"
+  /usr/bin/setpci -s "$port" CAP_EXP+10.w=0010:0010         # Link Control: Link Disable
+  logger -t disable-wifi-card "removed $(basename "$d"), link disabled at $port"
+done
+exit 0

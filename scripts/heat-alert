@@ -19,7 +19,7 @@ STATE=/run/heat-alert.state
 WEBHOOK=""
 [[ -r /etc/heat-alert.conf ]] && . /etc/heat-alert.conf
 
-log() { logger -t heat-alert "$*"; [[ -t 1 ]] && echo "heat-alert: $*"; }
+log() { logger -t heat-alert "$*"; [[ -t 1 ]] && echo "heat-alert: $*"; return 0; }
 
 read_temp() {
   local h
